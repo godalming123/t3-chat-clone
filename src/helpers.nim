@@ -1,8 +1,8 @@
 from macros import `[]`
 from std/sequtils import map
-from std/sugar import collect
 from std/genasts import genAst
 from std/options import nil
+from std/sets import contains
 
 macro debugMacrosUntyped*(body: untyped) =
   echo macros.astGenRepr(body)
@@ -10,30 +10,28 @@ macro debugMacrosUntyped*(body: untyped) =
 macro debugMacros*(body: typed) =
   echo macros.strVal(macros.toStrLit(body))
 
-func listToStr(list: seq[string]): string =
+func listToStr[T](list: varargs[T]): string =
   case len(list)
   of 0:
     return ""
   of 1:
-    return list[0]
+    return $list[0]
   else:
     for i in 0..len(list)-2:
-      result &= list[i] & ", "
-    result &= "or " & list[len(list)-1]
+      result &= $list[i] & ", "
+    result &= "or " & $list[len(list)-1]
 
-template errorAssert(condition: bool, msg: string, location: NimNode) =
+template errorAssert*(condition: bool, msg: string, location: NimNode) =
   # This is a template so that `msg` and `location` are not evaluated unless condition is false
   if not condition:
     macros.error(msg, location)
 
-func expectType(node: NimNode, firstExpectedType: macros.NimNodeKind, otherExpectedTypes: varargs[macros.NimNodeKind]) =
-  if macros.kind(node) == firstExpectedType: return
-  for i in 0..len(otherExpectedTypes)-1:
-    if macros.kind(node) == otherExpectedTypes[i]: return
-  let expectedTypeStrings = collect:
-    for elem in sequtils.concat(@[firstExpectedType], sequtils.toSeq(otherExpectedTypes)):
-      $elem
-  macros.error("Expected node of type " & listToStr(expectedTypeStrings) & ", but got node of type " & $macros.kind(node), node)
+func expectType*(node: NimNode, expectedTypes: varargs[macros.NimNodeKind]) =
+  errorAssert(
+    macros.kind(node) in sets.toHashSet(expectedTypes),
+    "Expected node of type " & listToStr(expectedTypes) & ", but got node of type " & $macros.kind(node),
+    node,
+  )
 
 template update(ast: var untyped, args: varargs[untyped]): untyped =
   ast = genAst(prevAst = ast, args)
@@ -43,24 +41,28 @@ type capturedVariable = object
   varName: string
   initialValue: NimNode
 
-func checkAstHead(got: NimNode, expected: NimNode, check: var NimNode, capturedVariables: var seq[capturedVariable]): (int, int) =
-  case macros.strVal(expected[0])
-    of "call":
-      let varIdent = expected[1]
-      expectType(varIdent, macros.nnkIdent, macros.nnkStrLit)
-      check.update(got, expectedLen = macros.len(expected)-1):
-        prevAst and macros.kind(got) == macros.nnkCall and macros.len(got) == expectedLen
-      let name = macros.strVal(varIdent)
-      if macros.kind(varIdent) == macros.nnkStrLit:
-        check.update(got, name, prevAst and (macros.strVal(got[0]) == name))
-      elif name != "_":
-        capturedVariables.add(capturedVariable(
-          varType: macros.newIdentNode("string"),
-          varName: name,
-          initialValue: genAst(got, varIdent, varIdent = macros.strVal(got[0])),
-        ))
-      return (1, 2)
+func matchesFunc(got: NimNode, expected: NimNode, check: var NimNode, capturedVariables: var seq[capturedVariable]) =
+  expectType(expected, macros.nnkCall, macros.nnkIdent)
 
+  # Check the node type
+  if macros.kind(expected) == macros.nnkIdent:
+    if macros.strVal(expected) != "_":
+      capturedVariables.add(capturedVariable(
+        varType: macros.newIdentNode("NimNode"),
+        varName: macros.strVal(expected),
+        initialValue: genAst(got, got),
+      ))
+    return
+
+  case macros.strVal(expected[0])
+    of "stmtList":   check.update(got, prevAst and macros.kind(got) == macros.nnkStmtList)
+    of "par":        check.update(got, prevAst and macros.kind(got) == macros.nnkPar)
+    of "returnStmt": check.update(got, prevAst and macros.kind(got) == macros.nnkReturnStmt)
+    of "call":       check.update(got, prevAst and macros.kind(got) == macros.nnkCall)
+    of "asgn":       check.update(got, prevAst and macros.kind(got) == macros.nnkAsgn)
+    of "infix":      check.update(got, prevAst and macros.kind(got) == macros.nnkInfix)
+
+    # TODO: Deduplicate the code in these 3 of clauses
     of "intLit":
       errorAssert(macros.len(expected) == 2, "Expected 1 argument (value of int literal)", expected)
       let expectedInt = expected[1]
@@ -75,27 +77,37 @@ func checkAstHead(got: NimNode, expected: NimNode, check: var NimNode, capturedV
           varName: macros.strVal(expectedInt),
           initialValue: genAst(got, macros.intVal(got)),
         ))
-      return (0, 2)
-
-    of "stmtList":
-      check.update(got, expectedLen = macros.len(expected)-1):
-        prevAst and macros.len(got) == expectedLen and got.kind == macros.nnkStmtList
-      return (0, 1)
-
-    of "asgn":
-      errorAssert(macros.len(expected) == 3, "Expected 2 arguments (name of variable being assigned to and value being assigned)", expected)
-      expectType(expected[1], macros.nnkIdent, macros.nnkIntLit)
-      check.update(got, prevAst and got.kind == macros.nnkAsgn)
-      let name = macros.strVal(expected[1])
-      if macros.kind(expected[1]) == macros.nnkStrLit:
-        check.update(got, name, prevAst and macros.strVal(got[0]) == name)
-      elif name != "_":
+      return
+    of "ident":
+      errorAssert(macros.len(expected) == 2, "Expected 1 argument (value of identifier)", expected)
+      let expectedName = expected[1]
+      expectType(expectedName, macros.nnkIdent, macros.nnkStrLit)
+      check.update(got, prevAst and got.kind == macros.nnkIdent)
+      if macros.kind(expectedName) == macros.nnkStrLit:
+        check.update(got, expectedValue = macros.strVal(expectedName)):
+          prevAst and macros.strVal(got) == expectedValue
+      elif macros.strVal(expectedName) != "_":
         capturedVariables.add(capturedVariable(
           varType: macros.newIdentNode("string"),
-          varName: name,
-          initialValue: genAst(got, macros.strVal(got[0])),
+          varName: macros.strVal(expectedName),
+          initialValue: genAst(got, macros.strVal(got)),
         ))
-      return (1, 2)
+      return
+    of "strLit":
+      errorAssert(macros.len(expected) == 2, "Expected 1 argument (value of string)", expected)
+      let expectedName = expected[1]
+      expectType(expectedName, macros.nnkIdent, macros.nnkIntLit)
+      check.update(got, prevAst and got.kind == macros.nnkStrLit)
+      if macros.kind(expectedName) == macros.nnkIntLit:
+        check.update(got, expectedValue = macros.strVal(expectedName)):
+          prevAst and macros.strVal(got) == expectedValue
+      elif macros.strVal(expectedName) != "_":
+        capturedVariables.add(capturedVariable(
+          varType: macros.newIdentNode("string"),
+          varName: macros.strVal(expectedName),
+          initialValue: genAst(got, macros.strVal(got)),
+        ))
+      return
 
     else:
       if macros.strVal(expected[0]) != "_":
@@ -104,42 +116,46 @@ func checkAstHead(got: NimNode, expected: NimNode, check: var NimNode, capturedV
           varName: macros.strVal(expected[0]),
           initialValue: genAst(got, macros.kind(got)),
         ))
-      check.update(got, expectedLen = macros.len(expected)):
-        prevAst and macros.len(got) == expectedLen
-      return (0, 1)
 
-func matchesFunc(got: NimNode, expected: NimNode, check: var NimNode, capturedVariables: var seq[capturedVariable]) =
-  expectType(expected, macros.nnkCall, macros.nnkIdent)
+  let expectedElems = expected[1..macros.len(expected)-1]
 
-  # Check that the node type is the same
-  if macros.kind(expected) == macros.nnkIdent:
-    if macros.strVal(expected) != "_":
-      capturedVariables.add(capturedVariable(
-        varType: macros.newIdentNode("NimNode"),
-        varName: macros.strVal(expected),
-        initialValue: genAst(got, got),
-      ))
+  # Get the index of the spread capture (if there is one)
+  var spreadCaptureIndex = len(expectedElems)
+  for i, elem in expectedElems.pairs:
+    if macros.kind(elem) == macros.nnkPrefix and macros.strVal(elem[0]) == "...":
+      errorAssert(spreadCaptureIndex == len(expectedElems), "Multiple spread captures in the same node are not supported", elem)
+      spreadCaptureIndex = i
+
+  # Compare the length of got and expected
+  if spreadCaptureIndex == len(expectedElems):
+    check.update(got, expectedLen = len(expectedElems)):
+      prevAst and macros.len(got) == expectedLen
+  else:
+    check.update(got, expectedLen = len(expectedElems) - 1):
+      prevAst and macros.len(got) >= expectedLen
+
+  # Check the node items before the spread capture
+  for i in 0..<spreadCaptureIndex:
+    matchesFunc(genAst(got, i, got[i]), expectedElems[i], check, capturedVariables)
+
+  # Check the spread capture
+  if spreadCaptureIndex == len(expectedElems):
     return
-  var (gotIndex, expectedIndex) = checkAstHead(got, expected, check, capturedVariables)
+  let name = macros.strVal(expectedElems[spreadCaptureIndex][1])
+  if name != "_":
+    capturedVariables.add(capturedVariable(
+      varType: macros.newTree(macros.nnkBracketExpr, macros.newIdentNode("seq"), macros.newIdentNode("NimNode")),
+      varName: name,
+      initialValue: genAst(got, spreadCaptureIndex, expectedElemsLeft=len(expectedElems)-spreadCaptureIndex, got[spreadCaptureIndex..macros.len(got)-expectedElemsLeft])
+    ))
 
-  # Check that the node items are the same
-  while expectedIndex < macros.len(expected):
-    if macros.kind(expected[expectedIndex]) == macros.nnkPrefix and macros.strVal(expected[expectedIndex][0]) == "...":
-      let name = macros.strVal(expected[expectedIndex][1])
-      if name != "_":
-        capturedVariables.add(capturedVariable(
-          varType: macros.newTree(macros.nnkBracketExpr, macros.newIdentNode("seq"), macros.newIdentNode("NimNode")),
-          varName: name,
-          initialValue: genAst(got, gotIndex, got[gotIndex..macros.len(got)-1]),
-        ))
-      errorAssert(expectedIndex == macros.len(expected)-1, "Elements after spread capture are not yet supported", expected[expectedIndex+1])
-      return
+  # Check the node items after the spread capture
+  var elementsLeft = len(expectedElems)-spreadCaptureIndex-1
+  while elementsLeft >= 1:
+    matchesFunc(genAst(got, elementsLeft, got[macros.len(got)-elementsLeft]), expectedElems[len(expectedElems) - elementsLeft], check, capturedVariables)
+    elementsLeft -= 1
 
-    matchesFunc(genAst(got, gotIndex, got[gotIndex]), expected[expectedIndex], check, capturedVariables)
-    gotIndex += 1
-    expectedIndex += 1
-
-func combine[T](dataIn: seq[T], combineFunc: proc(a: T, b: T): T {.noSideEffect.}): options.Option[T] =
+func combine*[T](dataIn: seq[T], combineFunc: proc(a: T, b: T): T {.noSideEffect.}): options.Option[T] =
   if len(dataIn) == 0:
     return options.none(T)
   var funcOut = dataIn[0]
