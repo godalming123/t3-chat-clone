@@ -5,13 +5,15 @@
 def main [--auto-restart (-r)] {
   if not ("./models/llama-2-7b-chat.Q4_K_M.gguf" | path exists) {
     mkdir ./models/
-    echo "Downloading AI model..."
+    print "Downloading AI model..."
     wget https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf -P ./models/
   }
 
   if not ("./main" | path exists) or (ls "./src/main.nim" | get modified) > (ls "./main" | get modified) {
-    echo "Compiling code..."
-    nim compile -o=main ./src/main.nim
+    print "Compiling code..."
+    do --ignore-errors=$auto_restart {
+      nim compile -o=main ./src/main.nim
+    }
   }
   
   print "Starting llama.cpp..."
@@ -24,12 +26,7 @@ def main [--auto-restart (-r)] {
     job spawn {
       print "Watching ./src/ folder to recompile and restart the app when there are changes to the source code..."
       watch ./src --quiet {
-        job list | each {
-          |job|
-          if $job.tag? == "app" {
-            job kill $job.id
-          }
-        }
+        job list | where tag? == "app" | each {|job| job kill $job.id}
         let _ = job spawn --tag "app" {
           print "Recompiling code..."
           nim compile -o=./main ./src/main.nim o+e>| print
@@ -41,12 +38,7 @@ def main [--auto-restart (-r)] {
     }
   }
 
-  print "Press q to exit"
-  loop {
-    let key = input listen
-    if $key.code? == "q" {
-      job list | each {|job| job kill $job.id}
-      break
-    }
-  }
+  print "Press enter to exit"
+  ^read
+  job list | each {|job| job kill $job.id} | ignore
 }
