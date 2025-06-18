@@ -10,6 +10,11 @@ macro debugMacrosUntyped*(body: untyped) =
 macro debugMacros*(body: typed) =
   echo macros.strVal(macros.toStrLit(body))
 
+func repr*[T] (option: options.Option[T]): string =
+  if options.isSome(option):
+    return "options.some(" & repr(options.get(option)) & ")"
+  return "options.none(" & repr(type(option)) & ")"
+
 func listToStr[T](list: varargs[T]): string =
   case len(list)
   of 0:
@@ -60,6 +65,8 @@ func matchesFunc(got: NimNode, expected: NimNode, check: var NimNode, capturedVa
     of "returnStmt": check.update(got, prevAst and macros.kind(got) == macros.nnkReturnStmt)
     of "call":       check.update(got, prevAst and macros.kind(got) == macros.nnkCall)
     of "asgn":       check.update(got, prevAst and macros.kind(got) == macros.nnkAsgn)
+    of "exprEqExpr": check.update(got, prevAst and macros.kind(got) == macros.nnkExprEqExpr)
+    of "blockStmt":  check.update(got, prevAst and macros.kind(got) == macros.nnkBlockStmt)
     of "infix":      check.update(got, prevAst and macros.kind(got) == macros.nnkInfix)
 
     # TODO: Deduplicate the code in these 3 of clauses

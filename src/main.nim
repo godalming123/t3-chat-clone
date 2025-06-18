@@ -1,51 +1,59 @@
 from options import nil
 from asyncdispatch import nil
-from macros import strVal, `[]`, kind
 from httpx import nil
+from framework import nil
 
-func flexStyle(nodeName: string): string =
-  " style=\"display:flex;gap:0.5rem;" & (if nodeName == "column": "flex-direction:column;" else: "") & "\""
+#func flexStyle(nodeName: string): string =
+#  " style=\"display:flex;gap:0.5rem;" &
+#    (if nodeName == "column": "flex-direction:column;" else: "") & "\""
+#
+#func htmlElement(props: ((string, string), string)): string =
+#  var ((elemName, elemProps), elemContents) = props
+#  if elemName == "":
+#    return elemContents
+#  else:
+#    return "<" & elemName & elemProps & ">" & elemContents & "</" & elemName & ">"
+#
+#func elemProps(node: NimNode): ((string, string), string) =
+#  case node.kind
+#  of macros.nnkCall:
+#    var elementContents = ""
+#    var elementProps = ""
+#    for i in 1..macros.len(node)-1:
+#      case node[i].kind
+#      of macros.nnkExprEqExpr:
+#        elementProps &= " " & node[i][0].strVal & node[i][1].strVal
+#      else:
+#        elementContents &= node[i].elemProps().htmlElement()
+#    return (
+#      (case node[0].strVal
+#      of "row", "column":
+#        ("div", flexStyle(node[0].strVal) & elementProps)
+#      of "text":
+#        ("span", elementProps)
+#      else:
+#        (node[0].strVal, elementProps)),
+#      elementContents,
+#    )
+#  of macros.nnkStrLit:
+#    return (("", ""), node.strVal)
+#  else:
+#    macros.error("Expected `nnkCall` or `nnkStrLit`, but got " & $node.kind, node)
 
-func elemProps(node: NimNode): ((string, string), string) =
-  case node.kind
-  of macros.nnkCall:
-    var elementContents = ""
-    for i in 1..macros.len(node)-1:
-      var ((elemName, elemProps), elemContents) = elemProps(node[i])
-      if elemName == "":
-        elementContents &= elemContents
-      else:
-        elementContents &= "<" & elemName & elemProps & ">" & elemContents & "</" & elemName & ">"
-    return (
-      (case node[0].strVal
-      of "row", "column":
-        ("div", flexStyle(node[0].strVal))
-      of "text":
-        ("span", "")
-      else:
-        (node[0].strVal, "")),
-      elementContents,
-    )
-  of macros.nnkStrLit:
-    return (("", ""), node.strVal)
-  else:
-    macros.error("Expected `nnkCall` or `nnkStrLit`, but got " & $node.kind, node)
-
-macro page*(contents: untyped): untyped =
-  var ((_, props), content) = elemProps(contents)
-  return macros.newLit("<html><body" & props & ">" & content & "</html></body>")
-
-const homePage = page(
-  row(
-    column(
-      button("chat 1"),
-      button("chat 2"),
-      button("chat 3"),
-      button("chat 4"),
-    ),
-    h1("hello world")
+framework.component(Counter):
+  count = state(4)
+  doubleCount = derived(count * 2)
+  button(
+    onclick = block:
+      count = count + 1, # TODO: Add support for +=
+    "Count is $count$, doubled is $doubleCount$",
   )
-)
+
+framework.component(HomePage):
+  Counter()
+  Counter()
+
+const homePage = framework.page(HomePage)
 
 proc onRequest(req: httpx.Request): asyncdispatch.Future[void] =
   if httpx.httpMethod(req) == options.some(httpx.HttpGet):
