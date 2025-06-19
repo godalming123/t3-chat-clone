@@ -103,9 +103,24 @@ func matchesFunc(got: NimNode, expected: NimNode, check: var NimNode, capturedVa
     of "strLit":
       errorAssert(macros.len(expected) == 2, "Expected 1 argument (value of string)", expected)
       let expectedName = expected[1]
-      expectType(expectedName, macros.nnkIdent, macros.nnkIntLit)
+      expectType(expectedName, macros.nnkIdent, macros.nnkStrLit)
       check.update(got, prevAst and got.kind == macros.nnkStrLit)
-      if macros.kind(expectedName) == macros.nnkIntLit:
+      if macros.kind(expectedName) == macros.nnkStrLit:
+        check.update(got, expectedValue = macros.strVal(expectedName)):
+          prevAst and macros.strVal(got) == expectedValue
+      elif macros.strVal(expectedName) != "_":
+        capturedVariables.add(capturedVariable(
+          varType: macros.newIdentNode("string"),
+          varName: macros.strVal(expectedName),
+          initialValue: genAst(got, macros.strVal(got)),
+        ))
+      return
+    of "tripleStrLit":
+      errorAssert(macros.len(expected) == 2, "Expected 1 argument (value of string)", expected)
+      let expectedName = expected[1]
+      expectType(expectedName, macros.nnkIdent, macros.nnkStrLit)
+      check.update(got, prevAst and got.kind == macros.nnkTripleStrLit)
+      if macros.kind(expectedName) == macros.nnkStrLit:
         check.update(got, expectedValue = macros.strVal(expectedName)):
           prevAst and macros.strVal(got) == expectedValue
       elif macros.strVal(expectedName) != "_":

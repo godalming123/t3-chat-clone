@@ -49,11 +49,35 @@ framework.component(Counter):
     "Count is $count$, doubled is $doubleCount$",
   )
 
-framework.component(HomePage):
-  Counter()
-  Counter()
+framework.component(Chat):
+  text = state("Loding...")
+  onload = """
+    const decoder = new TextDecoder("utf-8");
+    let response = await fetch("http://127.0.0.1:11434/api/generate", {
+      "body": `{"model": "llama3.2", "prompt": "Why is the sky blue?"}`,
+      "method": "POST",
+      "mode": "cors"
+    })
+    let reader = response.body.getReader()
+    set_text("")
+    while (true) {
+      let {value, done} = await reader.read()
+      let json = decoder.decode(value, {stream: true})
+      if (json != "") {
+        try {
+          set_text(get_text() + JSON.parse(json).response)
+        } catch (err) {
+          set_text(`tried to parse the json "${json}", but got error "${err.message}"`)
+        }
+      }
+      if (done) {break}
+    }
+  """
+  span("$text$")
+  br()
+  input(type = "text", placeholder = "Type your message here...")
 
-const homePage = framework.page(HomePage)
+const homePage = framework.page(Chat)
 
 proc onRequest(req: httpx.Request): asyncdispatch.Future[void] =
   if httpx.httpMethod(req) == options.some(httpx.HttpGet):

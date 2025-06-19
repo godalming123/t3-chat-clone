@@ -1,13 +1,10 @@
 #!/usr/bin/env nix-shell
-#! nix-shell -p nushell nim llama-cpp wget
+#! nix-shell -p nushell nim ollama
 #! nix-shell -i nu
 
 def main [--auto-restart (-r)] {
-  if not ("./models/llama-2-7b-chat.Q4_K_M.gguf" | path exists) {
-    mkdir ./models/
-    print "Downloading AI model..."
-    wget https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf -P ./models/
-  }
+  print "Starting ollama server..."
+  job spawn {ollama serve}
 
   if not ("./main" | path exists) or (ls "./src/main.nim" | get modified) > (ls "./main" | get modified) {
     print "Compiling code..."
@@ -15,9 +12,9 @@ def main [--auto-restart (-r)] {
       nim compile -o=main ./src/main.nim
     }
   }
-  
-  print "Starting llama.cpp..."
-  job spawn {llama-server -m ./models/llama-2-7b-chat.Q4_K_M.gguf -c 4096 --host 0.0.0.0 --port 4000}
+
+  print "Downloading AI model..."
+  ollama pull llama3.2
 
   print "Starting app..."
   job spawn --tag "app" {./main -d 127.0.0.1:8080}

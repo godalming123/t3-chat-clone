@@ -150,7 +150,7 @@ proc calculateDerivedValue(data: tables.Table[string, VariableInfo], derivedValu
   elif matches(derivedValue, par(contents)):
     calculateDerivedValue(data, contents)
   else:
-    macros.error("Did not match derived contents, got " & macros.astGenRepr(derivedValue), derivedValue)
+    macros.error("Did not match derived contents, got " & macros.treeRepr(derivedValue), derivedValue)
 
 # Returns true if the update value func changed and false otherwise
 func addToUpdateValueFunc(varInfo: var VariableInfo, codeToAdd: string): bool =
@@ -202,6 +202,9 @@ type Component* = object
   initialHtml: string
   componentJs: string
   jsFromOtherComponentsRequired: sets.HashSet[string]
+  # Set to a blank string if the component does not have an onload function
+  # The function body is stored within `componentJs`
+  onLoadFunctionName: string
 
 var components {.compileTime.} = tables.initTable[string, Component]()
 
@@ -222,6 +225,9 @@ proc getInitialHtml(
   elements: openArray[NimNode],
   htmlLocation: string,
   nestedLayersAfterComponentRoot: int,
+  # Key is the components name, value is a sequence of the html locations where that component is used
+  # Does not include components that are used indirectly
+  otherComponentsUsed: var tables.Table[string, seq[string]],
 ): string =
   # TODO: Support adding variables to the markup without formatted strings
 
@@ -235,12 +241,14 @@ proc getInitialHtml(
     if matches(elements[i], call(ident(elemName), ...args)):
       if elemName.len >= 1 and 'A' <= elemName[0] and elemName[0] <= 'Z':
         helpers.errorAssert(tables.hasKey(components, elemName), "Component called `" & elemName & "` does not exist", elements[i][0])
+        if not tables.hasKey(otherComponentsUsed, elemName):
+          otherComponentsUsed[elemName] = @[]
+        otherComponentsUsed[elemName].add(htmlLocation & ".children[" & $i & "]")
         sets.incl(jsFromOtherComponentsRequired, elemName)
         sets.incl(cssClassesRequired, components[elemName].cssClassesRequired)
         result &= components[elemName].initialHtml
         continue
 
-      helpers.errorAssert(len(args) > 0, "Expected node contents, but got nothing", elements[i])
       var properties = ""
       var j = 0
       while j < len(args):
@@ -267,12 +275,61 @@ proc getInitialHtml(
         else:
           discard
         j += 1
-      helpers.errorAssert(j < len(args), "Expected node contents after this node property, but got nothing", args[j-1])
-      result &= "<" & elemName & properties & ">" &
-        getInitialHtml(data, jsFromOtherComponentsRequired, cssClassesRequired, args[j..len(args)-1], htmlLocation & ".children[" & $i & "]", nestedLayersAfterComponentRoot+1) &
-        "</" & elemName & ">"
+      var elemContentsAndEnd = ""
+      case elemName
+      of "input", "br":
+        helpers.errorAssert(j == len(args), "Expect no element contents for `" & elemName & "` elements, but got element contents", args[j])
+      else:
+        elemContentsAndEnd =
+          getInitialHtml(
+            data,
+            jsFromOtherComponentsRequired,
+            cssClassesRequired,
+            args[j..<len(args)],
+            htmlLocation & ".children[" & $i & "]",
+            nestedLayersAfterComponentRoot+1,
+            otherComponentsUsed,
+          ) & "</" & elemName & ">"
+      result &= "<" & elemName & properties & ">" & elemContentsAndEnd
     else:
       macros.error("Did not match, got " & macros.treeRepr(elements[i]), elements[i])
+
+proc defineVariable(data: var tables.Table[string, VariableInfo], varName: string, varNameNode: NimNode, varValue: NimNode) =
+  helpers.errorAssert(not tables.hasKey(data, varName), "Redeclaration of variable called " & varName, varNameNode)
+
+  if matches(varValue, call(ident("state"), value)):
+    let valueData =
+      if matches(value, intLit(v)): Data(kind: Int, intVal: v)
+      elif matches(value, strLit(v)): Data(kind: String, strVal: v)
+      else: macros.error("Does not match", value)
+    data[varName] = VariableInfo(
+      kind: State,
+      stateUpdateValueFuncName: getNextFunctionName(),
+      stateUpdateValueFuncContents: @["if (newValue == componentRoot.getAttribute(`state_" & varName & "`)) {return};componentRoot.setAttribute(`state_" & varName & "`," & "newValue)"],
+      stateInitialValue: valueData,
+    )
+  elif matches(varValue, call(ident("derived"), value)):
+    let (initialVal, updateValueJs, dependencies) = calculateDerivedValue(data, value)
+    if sets.len(dependencies) == 0:
+      macros.error("Unnecersarry call to `derived`", value)
+    let funcName = getNextFunctionName()
+    let updateDependencyCode = funcName & "(componentRoot)"
+    var hasVariableDependencies = false
+    for dep in sets.items(dependencies):
+      hasVariableDependencies = hasVariableDependencies or data[dep].addToUpdateValueFunc(updateDependencyCode)
+    if hasVariableDependencies == false:
+      macros.error("Unnecersarry call to `derived`", value)
+    data[varName] = VariableInfo(
+      kind: Derived,
+      derivedInitialValue: initialVal,
+      recalculateValueFuncContents: @["componentRoot.setAttribute(`state_" & varName & "`," & updateValueJs & ")"],
+      recalculateValueFuncName: funcName,
+    )
+  elif matches(varValue, call(ident("arg"))):
+    # TODO: Add support for arguments
+    data[varName] = VariableInfo()
+  else:
+    macros.error("Does not match", varValue)
 
 macro component*(name: untyped, node: untyped) =
   helpers.errorAssert(name.kind == macros.nnkIdent, "Expected macro name as identifier", name)
@@ -283,48 +340,18 @@ macro component*(name: untyped, node: untyped) =
   # Parse the components data
   var data = tables.initTable[string, VariableInfo]()
   var i = 0
-  var funcName = getNextFunctionName()
+  var userOnloadBody = ""
   while i < macros.len(node):
-    if matches(node[i], asgn(ident(varName), varValue)):
-      if tables.hasKey(data, varName):
-        macros.error("Redeclaration of variable called " & varName, node[i][0])
-
-      if matches(varValue, call(ident("state"), value)):
-        let valueData =
-          if matches(value, intLit(v)): Data(kind: Int, intVal: v)
-          elif matches(value, strLit(v)): Data(kind: String, strVal: v)
-          else: macros.error("Does not match", value)
-        data[varName] = VariableInfo(
-          kind: State,
-          stateUpdateValueFuncName: funcName,
-          stateUpdateValueFuncContents: @["if (newValue == componentRoot.getAttribute(`state_" & varName & "`)) {return};componentRoot.setAttribute(`state_" & varName & "`," & "newValue)"],
-          stateInitialValue: valueData,
-        )
-      elif matches(varValue, call(ident("derived"), value)):
-        let (initialVal, updateValueJs, dependencies) = calculateDerivedValue(data, value)
-        if sets.len(dependencies) == 0:
-          macros.error("Unnecersarry call to `derived`", value)
-        let updateDependencyCode = funcName & "(componentRoot)"
-        var hasVariableDependencies = false
-        for dep in sets.items(dependencies):
-          hasVariableDependencies = hasVariableDependencies or data[dep].addToUpdateValueFunc(updateDependencyCode)
-        if hasVariableDependencies == false:
-          macros.error("Unnecersarry call to `derived`", value)
-        data[varName] = VariableInfo(
-          kind: Derived,
-          derivedInitialValue: initialVal,
-          recalculateValueFuncContents: @["componentRoot.setAttribute(`state_" & varName & "`," & updateValueJs & ")"],
-          recalculateValueFuncName: funcName,
-        )
-      elif matches(varValue, call(ident("arg"))):
-        # TODO: Add support for arguments
-        data[varName] = VariableInfo()
-        continue # Don't allocate a new function name since the previous function name was not used
+    if matches(node[i], asgn(ident(propName), propValue)):
+      if propName == "onload":
+        if matches(propValue, tripleStrLit(onloadFunctionBody)):
+          helpers.errorAssert(userOnloadBody == "", "The onload function can only be set once", node[i])
+          helpers.errorAssert(onloadFunctionBody != "", "Setting the onload function to \"\" has no effect", node[i])
+          userOnloadBody = onloadFunctionBody
+        else:
+          macros.error("Expected string literal for the body of the onload function, but got " & macros.treeRepr(node[i][1]))
       else:
-        macros.error("Does not match", varValue)
-
-      funcName = getNextFunctionName()
-
+        defineVariable(data, propName, node[i][0], propValue)
     else:
       break
     i += 1
@@ -337,12 +364,31 @@ macro component*(name: untyped, node: untyped) =
   # Parse the components markup
   var requiredClasses = sets.initHashSet[string]() # TODO: Add tailwind style classes for styling
   var jsFromOtherComponentsRequired = sets.initHashSet[string]()
+  var otherComponentsUsed = tables.initTable[string, seq[string]]()
   let nodeContents = node[i..macros.len(node)-1]
   helpers.errorAssert(len(nodeContents) > 0, "Node does not have any contents", node)
-  let initialHtml = "<div" & initialState & ">" & getInitialHtml(data, jsFromOtherComponentsRequired, requiredClasses, nodeContents, "componentRoot", 1) & "</div>"
+  let initialHtml = "<div" & initialState & ">" & getInitialHtml(data, jsFromOtherComponentsRequired, requiredClasses, nodeContents, "componentRoot", 1, otherComponentsUsed) & "</div>"
+
+  # Parse onload function
+  var onloadBody = newSeq[string]()
+  for compName, compUses in tables.pairs(otherComponentsUsed):
+    if components[compName].onLoadFunctionName != "":
+      for use in compUses:
+        onloadBody.add(components[compName].onLoadFunctionName & "(" & use & ")")
+  if userOnloadBody != "":
+    onloadBody.add(userOnloadBody)
+  var onloadName = ""
+  var onloadFunc = ""
+  if len(onloadBody) > 0:
+    for name, value in tables.pairs(data):
+      if value.kind == State:
+        onloadBody.insert("const get_" & name & " = () => componentRoot.getAttribute(\"state_" & name & "\")")
+        onloadBody.insert("const set_" & name & " = (newValue) => " & value.stateUpdateValueFuncName & "(componentRoot, newValue)")
+    onloadName = getNextFunctionName()
+    onloadFunc = "async function " & onloadName & "(componentRoot){" & onloadBody.join(";") & "}"
 
   # Parse the JS in order for the component to be interactive
-  var variablesJs = newSeq[string]()
+  var componentJs = if onloadFunc != "": @[onloadFunc] else: newSeq[string]()
   for varInfo in tables.values(data):
     let stateUpdateFunction = stateUpdateFunction(varInfo)
     if options.isNone(stateUpdateFunction): continue
@@ -350,15 +396,15 @@ macro component*(name: untyped, node: untyped) =
     if len(stateUpdateFunc.contents) == 0: continue
     let stateUpdateFuncArgs = "componentRoot" & (if stateUpdateFunc.hasNewValueArg: ", newValue" else: "")
     let stateUpdateFuncBody = stateUpdateFunc.contents.join(";")
-    variablesJs.add("function " & stateUpdateFunc.name & "(" & stateUpdateFuncArgs & "){" & stateUpdateFuncBody & "}")
-  var componentJs = variablesJs.join(" ")
+    componentJs.add("function " & stateUpdateFunc.name & "(" & stateUpdateFuncArgs & "){" & stateUpdateFuncBody & "}")
   
   # Return
   components[componentName] = Component(
     cssClassesRequired: requiredClasses,
     initialHtml: initialHtml,
-    componentJs: componentJs,
+    componentJs: componentJs.join(" "),
     jsFromOtherComponentsRequired: jsFromOtherComponentsRequired,
+    onloadFunctionName: onloadName,
   )
 
 macro page*(rootComponent: untyped): string =
@@ -369,5 +415,6 @@ macro page*(rootComponent: untyped): string =
   var js = rootComp.componentJs
   for comp in sets.items(rootComp.jsFromOtherComponentsRequired):
     js &= components[comp].componentJs
-  let res = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"></meta><title>TODO</title><meta name="viewport" content="width=device-width,initial-scale=1"></meta><script>""" & js & "</script></head><body>" & rootComp.initialHtml & "</body></html>"
+  let bodyProps = if rootComp.onloadFunctionName != "": " onload=\"" & rootComp.onloadFunctionName & "(event.target.children[0].children[1].children[0])\"" else: ""
+  let res = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"></meta><title>TODO</title><meta name="viewport" content="width=device-width,initial-scale=1"></meta><script>""" & js & "</script></head><body" & bodyProps & ">" & rootComp.initialHtml & "</body></html>"
   return macros.newLit(res)
